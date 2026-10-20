@@ -1,0 +1,42 @@
+services:
+  linebot:
+    build: .
+    # --- Server (Traefik path-based routing) ---
+    # ใช้ expose แทน ports และเพิ่ม labels ด้านล่าง
+    # --- Local dev ---
+    ports:
+      - "5000:5000"
+    secrets:
+      - line_channel_access_token
+      - line_channel_secret
+      - app_username
+      - app_password
+      - login_url
+      - base_url
+      - branch_map
+      - image_token
+    environment:
+      PORT: 5000
+      MAX_IMAGES: 9
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./image:/app/image
+    restart: unless-stopped
+
+secrets:
+  line_channel_access_token:
+    file: ./secrets/line_channel_access_token.txt
+  line_channel_secret:
+    file: ./secrets/line_channel_secret.txt
+  app_username:
+    file: ./secrets/app_username.txt
+  app_password:
+    file: ./secrets/app_password.txt
+  login_url:
+    file: ./secrets/login_url.txt
+  base_url:
+    file: ./secrets/base_url.txt
+  branch_map:
+    file: ./secrets/branch_map.txt
+  image_token:
+    file: ./secrets/image_token.txt
