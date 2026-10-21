@@ -490,9 +490,17 @@ def build_result_messages(keyword: str, results: list[dict], captured_at: str = 
     success_count = sum(1 for r in results if r.get("filename"))
     target_mode = (mode or SEND_MODE).strip().lower()
 
+    # ตรวจสอบความถูกต้องของ BASE_URL หากต้องการส่งรูปภาพ
+    has_valid_base_url = bool(BASE_URL and BASE_URL.startswith("https://"))
+    notice_prefix = ""
+    if not has_valid_base_url and target_mode in ("2", "image", "both"):
+        print(f"[WARN] BASE_URL ไม่ถูกต้องหรือไม่ได้ขึ้นต้นด้วย https:// ({BASE_URL}) — สลับไปใช้โหมดลิงก์ (link)")
+        target_mode = "link"
+        notice_prefix = "[แจ้งเตือน] ยังไม่ได้ตั้งค่า BASE_URL แบบ HTTPS บนเซิร์ฟเวอร์ กรุณาตรวจสอบ Environment Variables\n\n"
+
     if target_mode in ("1", "link"):
         # ── แบบที่ 1: ส่งเฉพาะลิงก์ (TextMessage) ──
-        summary_lines = [f"📊 {keyword} ({success_count}/{len(results)} รูป)\n"]
+        summary_lines = [f"{notice_prefix}📊 {keyword} ({success_count}/{len(results)} รูป)\n"]
         for r in results:
             if r.get("filename"):
                 url = generate_signed_url(r["filename"])
@@ -568,6 +576,40 @@ def build_result_messages(keyword: str, results: list[dict], captured_at: str = 
         return messages
 
 # ==============================
+# ฟังก์ชันส่งข้อความแบบปลอดภัย (Fallback ไปใช้ Push Message หาก Reply Token หมดอายุ)
+# ==============================
+def safe_send_messages(line_bot_api, reply_token, target_id, messages):
+    """
+    พยายามส่งผ่าน reply_message ก่อน
+    ถ้าเกิด timeout (เช่น แคปรูปนานเกิน 20-30 วินาที) หรือ reply_token หมดอายุ
+    จะ fallback ไปใช้ push_message ส่งให้ผู้ใช้ทันที เพื่อไม่ให้เกิดการเงียบหาย
+    """
+    try:
+        line_bot_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=reply_token,
+                messages=messages
+            )
+        )
+        print("[INFO] ส่งข้อความผ่าน reply_message สำเร็จ")
+        return True
+    except Exception as reply_err:
+        print(f"[WARN] reply_message ล้มเหลว ({reply_err}) — กำลัง fallback ไปใช้ push_message")
+        if target_id:
+            try:
+                line_bot_api.push_message(
+                    PushMessageRequest(
+                        to=target_id,
+                        messages=messages
+                    )
+                )
+                print("[INFO] Fallback ส่งข้อความผ่าน push_message สำเร็จ")
+                return True
+            except Exception as push_err:
+                print(f"[ERROR] push_message ล้มเหลวด้วย: {push_err}")
+    return False
+
+# ==============================
 # Webhook
 # ==============================
 @app.route("/webhook", methods=["GET"])
@@ -640,27 +682,35 @@ def handle_message(event):
                 "💡 เลือกลักษณะการส่งผลลัพธ์:\n"
                 "• /<คำสั่ง> (ส่งทั้งรูปในแชท + ลิงก์ความละเอียดสูง)\n"
                 "• /<คำสั่ง> 1 (แบบที่ 1: ส่งเฉพาะลิงก์)\n"
-                "• /<คำสั่ง> 2 (แบบที่ 2: ส่งเฉพาะรูปภาพในแชท)"
+                "• /<คำสั่ง> 2 (แบบที่ 2: ส่งเฉพาะรูปภาพในแชท)\n"
+                "• /status (ตรวจสอบสถานะเซิร์ฟเวอร์)"
             )
-            line_bot_api.reply_message( 
-                ReplyMessageRequest(
-                    reply_token=reply_token,
-                    messages=[TextMessage(text=help_text)]
-                )
+            safe_send_messages(line_bot_api, reply_token, target_id, [TextMessage(text=help_text)])
+            return
+
+        # /status หรือ /ping → ตรวจสอบสถานะการตั้งค่าบนเซิร์ฟเวอร์
+        if cmd in ("status", "debug", "ping"):
+            with cache_lock:
+                current_cache = load_cache()
+            status_text = (
+                "⚙️ สถานะระบบ LINE Bot:\n"
+                f"• BASE_URL: {BASE_URL or 'ยังไม่ได้ตั้งค่า (สำคัญ: ต้องเป็น https://)'}\n"
+                f"• โหมดเริ่มต้น: {SEND_MODE}\n"
+                f"• คำสั่งสาขา: {list(BRANCH_MAP.keys())}\n"
+                f"• แคชปัจจุบัน: {list(current_cache.keys()) or 'ยังไม่มีรูปในแคช'}"
             )
+            safe_send_messages(line_bot_api, reply_token, target_id, [TextMessage(text=status_text)])
             return
 
         # /<keyword> ไม่ตรงใน BRANCH_MAP
         keyword = cmd
         if keyword not in BRANCH_MAP:
             branch_list = "\n".join([f"• /{k}" for k in BRANCH_MAP.keys()])
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=reply_token,
-                    messages=[TextMessage(
-                        text=f"❓ ไม่พบคำสั่ง '/{keyword}'\n\nคำสั่งที่มี:\n{branch_list}\n\nพิมพ์ /keyword เพื่อดูรายการ"
-                    )]
-                )
+            safe_send_messages(
+                line_bot_api,
+                reply_token,
+                target_id,
+                [TextMessage(text=f"❓ ไม่พบคำสั่ง '/{keyword}'\n\nคำสั่งที่มี:\n{branch_list}\n\nพิมพ์ /keyword เพื่อดูรายการ")]
             )
             return
 
@@ -678,37 +728,21 @@ def handle_message(event):
             ]
             captured_at = next(iter(cached.values()), {}).get("captured_at", "")
             messages = build_result_messages(keyword, results, captured_at, mode=mode)
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=reply_token,
-                    messages=messages
-                )
-            )
+            safe_send_messages(line_bot_api, reply_token, target_id, messages)
             print(f"✅ Cache HIT '{keyword}' (mode: {mode}) — reply สำเร็จ")
             return
 
-        # ── Cache MISS: ไม่มีรูป → แคปรูปสดแล้ว reply ทันที ──
-        print(f"⏳ Cache MISS '{keyword}' — กำลังแคปรูปสดเพื่อ reply ทันที...")
+        # ── Cache MISS: ไม่มีรูป → แคปรูปสดแล้วส่งผลลัพธ์ ──
+        print(f"⏳ Cache MISS '{keyword}' — กำลังแคปรูปสด...")
         entries = normalize_entries(BRANCH_MAP[keyword])
         results = capture_screenshots(entries)
 
         if not results or all(r["filename"] is None for r in results):
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=reply_token,
-                    messages=[TextMessage(text=f"❌ แคปรูปทุก URL ของ '{keyword}' ล้มเหลว")]
-                )
-            )
-            return
-
-        if not BASE_URL:
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=reply_token,
-                    messages=[TextMessage(
-                        text="✅ แคปรูปสำเร็จ แต่ยังไม่ได้ตั้ง BASE_URL\nกรุณาเพิ่ม secret: base_url"
-                    )]
-                )
+            safe_send_messages(
+                line_bot_api,
+                reply_token,
+                target_id,
+                [TextMessage(text=f"❌ แคปรูปทุก URL ของ '{keyword}' ล้มเหลว")]
             )
             return
 
@@ -717,13 +751,8 @@ def handle_message(event):
 
         captured_at = datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%d %H:%M")
         messages = build_result_messages(keyword, results, captured_at, mode=mode)
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=messages
-            )
-        )
-        print(f"✅ Cache MISS '{keyword}' (mode: {mode}) — แคปรูปและ reply สำเร็จ")
+        safe_send_messages(line_bot_api, reply_token, target_id, messages)
+        print(f"✅ Cache MISS '{keyword}' (mode: {mode}) — แคปรูปและส่งผลลัพธ์สำเร็จ")
 
 # ==============================
 # เริ่ม Scheduler ระดับ module (ทำงานทั้ง gunicorn และ python โดยตรง)
